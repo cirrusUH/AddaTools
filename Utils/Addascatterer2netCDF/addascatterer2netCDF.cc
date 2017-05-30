@@ -1,0 +1,512 @@
+/**
+  Converts an ADDA scatterer description file (geom) into its netCDF representation
+  
+
+  assumes: c++11
+  G Ritter, London, Sept 2016
+ */
+
+#if 0
+// 140    int myid, num_procs;
+// 141    int n;
+// 142    double gamma, h;
+// 143    int vis;
+// 144 
+// 145    HYPRE_SStructGrid     grid;
+// 146    HYPRE_SStructGraph    graph;
+// 147    HYPRE_SStructMatrix   A;
+// 148    HYPRE_SStructVector   b;
+// 149    HYPRE_SStructVector   x;
+// 150 
+// 151    HYPRE_Solver          solver;
+// 152 
+// 153    /* Initialize MPI */
+// 154    MPI_Init(&argc, &argv);
+// 155    MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+// 156    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+// 157 
+// 158    /* Set default parameters */
+// 159    n = 10;
+// 160    vis = 0;
+// 161 
+// 162    /* Parse command line */
+// 163    {
+// 164       int arg_index = 0;
+// 165       int print_usage = 0;
+// 166 
+// 167       while (arg_index < argc)
+// 168       {
+// 169          if ( strcmp(argv[arg_index], "-n") == 0 )
+// 170          {
+// 171             arg_index++;
+// 172             n = atoi(argv[arg_index++]);
+// 173          }
+// 174          else if ( strcmp(argv[arg_index], "-vis") == 0 )
+// 175          {
+// 176             arg_index++;
+// 177             vis = 1;
+// 178          }
+// 179          else if ( strcmp(argv[arg_index], "-help") == 0 )
+// 180          {
+// 181             print_usage = 1;
+// 182             break;
+// 183          }
+// 184          else
+// 185          {
+// 186             arg_index++;
+// 187          }
+// 188       }
+// 189 
+// 190       if ((print_usage) && (myid == 0))
+// 191       {
+// 192          printf("\n");
+// 193          printf("Usage: %s [<options>]\n", argv[0]);
+// 194          printf("\n");
+// 195          printf("  -n <n>              : problem size per processor (default: 10)\n");
+// 196          printf("  -vis                : save the solution for GLVis visualization\n");
+// 197          printf("\n");
+// 198       }
+// 199 
+// 200       if (print_usage)
+// 201       {
+// 202          MPI_Finalize();
+// 203          return (0);
+// 204       }
+// 205    }
+// 206 
+
+#endif
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <algorithm>
+
+using std::cout;
+using std::endl;
+using std::cerr;
+
+#include <grutils.hpp>
+
+#include <netcdf>
+using namespace netCDF;
+using namespace netCDF::exceptions;
+
+// Return this in event of a problem.
+static const int NC_ERR = 2;
+
+int main( int argc, char*argv[] )
+{
+
+bool checkconsistency = false; 
+bool writeprojections = true; 
+
+/*
+std::vector<std::string> args;
+std::copy(argv + 1, argv + argc, std::back_inserter(args));
+*/
+
+	if(argc<2)
+	{
+		cerr << "Usage: " << argv[0] << " filename " << endl; 
+		cerr << "       reads filename and (over)writes a filname.nc in netCDF format." << endl; 
+		return EXIT_FAILURE;
+	} 
+
+size_t filesize = getFilesize( argv[1] );
+	cout << "File size: " << filesize <<" or " << filesize /1024/1024 <<"MB"<< endl; 
+
+	std::ifstream infile; 
+
+	// in some scenarios some of these can improve io bandwidth.
+	// char *buf = new char[8196]; 
+	// 	infile.rdbuf()->pubsetbuf(buf, sizeof buf); 
+	//	std::ios_base::sync_with_stdio(false);	
+
+	infile.open( argv[1] );
+
+	if( !infile.is_open() )
+	{
+		cerr << "Error opening " << argv[1] << endl; 
+		return EXIT_FAILURE;
+	} 
+
+std::string ifilename, ofilename; 
+		ifilename = ofilename = argv[1]; 
+
+std::size_t dotpos = ofilename.find_last_of('.');
+	if( dotpos != std::string::npos)
+	{
+		ofilename = ofilename.substr(0, dotpos);
+	} 
+	ofilename = ofilename + ".nc";
+
+std::chrono::time_point<std::chrono::system_clock> start, end; 
+std::chrono::duration<double> elapsed_seconds;
+
+	start = std::chrono::system_clock::now(); 
+
+// information that should be in the header of a .geom file
+std::string versionstring; 
+std::string shapestring;
+std::size_t Nx, Ny, Nz;
+bool gridboxsizeinheader = false; 
+
+std::string line; 
+long long int linecounter = 1;  // first line is line 1 
+unsigned long long int Noccvoxels = 0;
+
+	while ( infile.peek()=='#')
+	{
+		if( !getline(infile, line) )
+		{
+			cerr << "Error reading file " << ifilename << endl; 
+			return EXIT_FAILURE;
+		} 
+
+		std::istringstream iss(line); 
+
+		if( line.size() == 0  || line.at(0) == '#')
+		{
+			cout << "header: " << line << endl; 
+
+			if( line.find("#box size: ") != std::string::npos )
+			{
+				line.erase( line.begin(), line.begin() + std::string("#box size: ").length() ); 
+				std::replace(  line.begin(), line.end(), 'x', ' '); 
+
+				std::istringstream isSize(line); 
+				if( !(isSize >> Nx >> Ny >> Nz) )
+				{
+					cerr << "Error reading grid box size " << linecounter << ": " << line 
+					     << "to recover it the file needs to be read in full twice." << endl; 
+					gridboxsizeinheader = false; 
+				} 
+				else
+				{
+					cout << "Gird box size given in header: " 
+					     << Nx << "," << Ny << "," << Nz << endl; 
+					gridboxsizeinheader = true; 
+				}
+			} 
+			else if( line.find("#generated by ") != std::string::npos)
+			{
+				line.erase( line.begin(), line.begin() + std::string("#generated by ").length() ); 
+				versionstring = line;
+			} 
+			else if( line.find("#shape: ") != std::string::npos)
+			{
+				line.erase( line.begin(), line.begin() + std::string("#shape: ").length() ); 
+				shapestring = line;
+			}
+			else
+			{
+				cout << "Header line " << linecounter << ": " << line << " ... skipped."<< endl; 
+				linecounter++; 
+			}
+		} 
+} 
+
+// post header 
+
+// check for multi material file
+unsigned int Nmat=1;
+	if(infile.peek()=='N' )
+	{
+		getline(infile, line); 
+
+		if( line.find("Nmat=") != std::string::npos)
+		{
+			line.erase( line.begin(), line.begin() + std::string("Nmat=").length() ); 
+
+			std::istringstream( line ) >> Nmat;
+
+			cout << "Found Nmat to be " << Nmat << endl;
+		} 
+		else
+		{
+			cerr << "Error reading material number in line " << linecounter << endl; 
+		} 
+
+		linecounter++;
+	} 
+
+const std::streampos afterheader=infile.tellg();
+std::size_t xMax, yMax, zMax, NmatMax; 
+	xMax = yMax = zMax = NmatMax = std::numeric_limits<std::size_t>::min(); 
+
+	if( !gridboxsizeinheader )
+	{
+		// recover the grid box size
+		cout << "Recovering the gridbox size and Nmat now" << endl; 
+
+		// read first line of dipoles, decide if it is 3 or 4 integers
+		getline(infile, line); 
+
+		// count number of integers in line: 3..single domain, 4..multidomain
+		std::istringstream iss(line); 
+	int dummy; 
+	int n=0; 
+		while( iss >> dummy )
+		{
+			n++;
+		}
+
+		infile.seekg(afterheader); 
+
+		size_t x,y,z; 
+		unsigned int m=1; 
+		while ( infile >> x >> y >> z )
+		{
+			if( n==4 )
+			{
+				if ( !(infile >> m) )
+				{
+					cerr << "Line " <<linecounter<< " parse error" <<endl; 
+					return EXIT_FAILURE;
+				} 
+			} 
+
+				// update min/max search 
+			if( x > xMax ) xMax = x; 
+			if( y > yMax ) yMax = y; 
+			if( z > zMax ) zMax = z; 
+			if( m > NmatMax ) NmatMax = m; 
+		} 
+
+		if ( infile.bad() )
+		{
+			cerr << "Line " <<linecounter<< " parse error" <<endl; 
+			return EXIT_FAILURE;
+		} 
+	
+		Nmat=m; 
+		Nx = xMax + 1; 
+		Ny = yMax + 1; 
+		Nz = zMax + 1; 
+
+			cout << "Gird box size recovered : " 
+			     << Nx << "," << Ny << "," << Nz << endl; 
+
+			cout << "second pass" << endl;
+	}
+
+
+size_t mem =  (Nx * Ny * Nz ); 
+	cout << "now reserve some memory ("<< double(mem)/(1024*1024*1024) <<" GB) or "<< mem<<" bytes and parse the data file" << endl; 
+
+unsigned char*volume; 
+
+unsigned char*Xprojection; 
+unsigned char*Yprojection; 
+unsigned char*Zprojection; 
+uint64_t NdplXproj,NdplYproj,NdplZproj; 
+	NdplXproj=NdplYproj=NdplZproj=0;
+
+	try {	
+		volume = new unsigned char [ mem ]; 
+
+		Xprojection = new unsigned char [ Ny*Nz ];
+		Yprojection = new unsigned char [ Nx*Nz ]; 
+		Zprojection = new unsigned char [ Nx*Ny ];
+	} catch(...) {
+		cerr << "Out of memory, we would have needed ~" << mem/1024 <<"MBs"<< endl; 
+		return EXIT_FAILURE;
+		} 
+		
+		std::fill( volume, volume + mem, 0 ); 
+		std::fill( Xprojection, Xprojection+Ny*Nz, 0 ); 
+		std::fill( Yprojection, Yprojection+Nx*Nz, 0 ); 
+		std::fill( Zprojection, Zprojection+Nx*Ny, 0 ); 
+
+		if( (Nmat > 15) && (Nmat < 256) )
+		{
+			cout << "Warning, number of materials found " << Nmat << " exceeds the default allowed maximum (15) of materials"
+			     << "setting in Adda. See section 6.3 of the Adda manual"
+			     << "you might need to recompile Adda "<<endl;
+		} 
+
+		if( Nmat >= 256 )
+		{
+		cerr << "Too many materials, this will not work without modifying the netCDF storage data type, bailing out." << endl; 
+		return EXIT_FAILURE;
+	} 
+	
+
+	/*  i5,SSD int x, y, z; // 67.3958MB/s
+	    i5 unsigned long  x, y, z; // 68.1903MB/s no buffer
+	    i5,SSD unsigned long  x, y, z; // 21.8226MB/s, buffer[8196] 
+	    ccluster  Elapsed time: 1360.85s  39.5646MB/s
+	    unsigned long  x, y, z; // 68.1521MB/s, sync_with_stdio(false) 
+	*/
+		size_t x,y,z; 
+		unsigned int m=1; 
+		while ( infile >> x >> y >> z )
+		{
+
+			if( Nmat > 1 )
+			{
+				if ( !(infile >> m) )
+				{
+					cerr << "Line " <<linecounter<< " parse error" <<endl; 
+					return EXIT_FAILURE;
+				} 
+			}
+
+			if( checkconsistency)
+			{
+
+				if( (gridboxsizeinheader == true) && ( x > Nx || y > Ny || z > Nz) )
+				{ 
+					cout << "Line " << linecounter <<" Error: Index larger than box size found in header" << endl; 
+					return EXIT_FAILURE; 
+				} 
+
+				if( volume[ tolinearC3D(x,y,z,Nx,Ny,Nz) ] !=0  ) 
+				{
+					cerr << "Line " <<linecounter<< "Warning: Dipole (" <<x<<", "<<y<<", "<<z<<") already declared"<<endl; 
+				} 
+
+				if( m > Nmat)
+				{
+					cout << "Line " << linecounter <<" Warning: wrong material" << endl; 
+					return EXIT_FAILURE; 	
+				}
+			} 
+
+			volume[ tolinearC3D(x,y,z,Nx,Ny,Nz) ] = m; 
+
+			if(writeprojections)
+			{
+				if( Xprojection[ tolinearC2D(y,z,Ny,Nz) ] == 0)
+				{
+					Xprojection[ tolinearC2D(y,z,Ny,Nz) ] = 1; 
+					NdplXproj++;
+				}
+
+				if( Yprojection[ tolinearC2D(x,z,Nx,Nz) ] == 0)
+				{
+					Yprojection[ tolinearC2D(x,z,Nx,Nz) ] = 1; 
+					NdplYproj++;
+				} 
+
+				if( Zprojection[ tolinearC2D(x,y,Nx,Ny) ] == 0 )
+				{
+					Zprojection[ tolinearC2D(x,y,Nx,Ny) ] = 1; 
+					NdplZproj++;
+				}
+			} 
+
+			//cout << "line "<<linecounter << " (" <<x<<", "<<y<<", "<<z<<"), m=" << m  << "index: " << tolinear(x,y,z,Nx,Ny,Nz) <<endl;
+
+			linecounter++; 
+			Noccvoxels++; 
+		} 
+
+		if ( infile.bad() )
+		{
+			cerr << "Line " <<linecounter<< " parse error" <<endl; 
+			return EXIT_FAILURE;
+		} 
+
+	elapsed_seconds = std::chrono::system_clock::now()-start; 
+
+	cout << "Reading done. " << endl 
+	     << "Elapsed time: " << elapsed_seconds.count() << "s  "       
+	     << (double(filesize)/1024/1024)/elapsed_seconds.count() << "MB/s" << endl; 
+
+	start = std::chrono::system_clock::now(); 
+
+	/*
+	  Dump netcdf here
+	*/ 
+
+	try
+	{  
+	NcFile dataFile( ofilename.c_str(), NcFile::replace); 
+
+		if( versionstring.length() == 0)
+		{
+			versionstring = "v.1.3b6";
+		} 
+
+		dataFile.putAtt("version",  versionstring ); 
+
+
+		dataFile.putAtt("history",  getNowTimestring_iso8061() + " file created from " + ifilename ); 
+
+		// Create netCDF dimensions 
+	NcDim xDim = dataFile.addDim("x", Nx); 
+	NcDim yDim = dataFile.addDim("y", Ny); 
+	NcDim zDim = dataFile.addDim("z", Nz); 
+
+		std::vector<NcDim> dims; 
+		dims.push_back(xDim); 
+		dims.push_back(yDim); 
+		dims.push_back(zDim); 
+		// infact different order seems to be the correct one.
+	NcVar geom = dataFile.addVar("geom", ncByte, dims); 
+		geom.setCompression( false, true, 9 ); 
+
+		geom.putAtt("Nmat", NcType::nc_INT, int(Nmat) ); 
+		geom.putAtt("N_occupied_dipols", NcType::nc_UINT64, Noccvoxels );  // or unsinged long long in C99.
+		// ncByte beingto be treated as unsigned (CF 1.6 standard)
+		int valid_min=0;
+		int valid_max=255;
+		geom.putAtt("valid_min", NcType::nc_INT, valid_min );    
+		geom.putAtt("valid_max", NcType::nc_INT, valid_max ); 
+
+		geom.putVar(volume); 
+
+		if(writeprojections)
+		{
+			dims.clear(); 
+			dims.push_back(zDim); 
+			dims.push_back(yDim); 
+		NcVar xproj = dataFile.addVar("Xprojection", ncByte, dims); 
+
+			xproj.putAtt("N_occupied_dipoles", NcType::nc_UINT64, int(NdplXproj) ); 
+		
+			xproj.putAtt("valid_min", NcType::nc_DOUBLE, double(0) );   
+			xproj.putAtt("valid_max", NcType::nc_DOUBLE, double(255) ); 
+
+			xproj.putVar(Xprojection ); 
+
+			dims.clear(); 
+			dims.push_back(zDim); 
+			dims.push_back(xDim); 
+		NcVar yproj = dataFile.addVar("Yprojection", ncByte, dims); 
+			yproj.putAtt("N_occupied_dipoles", NcType::nc_UINT64, int(NdplYproj) ); 
+		
+			yproj.putAtt("valid_min", NcType::nc_INT, double(0) );   
+			yproj.putAtt("valid_max", NcType::nc_INT, double(255) ); 
+
+			yproj.putVar(Yprojection ); 
+
+			dims.clear(); 
+			dims.push_back(yDim); 
+			dims.push_back(xDim); 
+		NcVar zproj = dataFile.addVar("Zprojection", ncByte, dims); 
+			zproj.putAtt("N_occupied_dipoles", NcType::nc_UINT64, int(NdplZproj) ); 
+			zproj.putAtt("valid_min", NcType::nc_INT, double(0) );   // this results in ncByte being treated as unsigned (CF 1.6 standard) 
+			zproj.putAtt("valid_max", NcType::nc_INT, double(255) ); 
+			zproj.putVar(Zprojection ); 
+	      }
+
+	}
+	catch(NcException& e)
+	{
+		e.what(); 
+		return NC_ERR;
+	} 
+
+	elapsed_seconds = std::chrono::system_clock::now()-start; 
+
+	cout << "Successfully written " << ofilename << endl 
+	     << "Elapsed time: " << elapsed_seconds.count() << "s  "       
+	     << (double(filesize)/1024/1024)/elapsed_seconds.count() << "MB/s" << endl; 
+
+	return EXIT_SUCCESS ;
+}
+
